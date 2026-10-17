@@ -1,0 +1,150 @@
+name: Build OrangeFox
+
+on:
+  workflow_dispatch:
+    inputs:
+      devices:
+        description: "코드네임 (쉼표 구분, 예: dm1q,dm2q,dm3q,q5q,gts9)"
+        required: true
+        default: "dm1q"
+      device_tree_owner:
+        description: "디바이스 트리 GitHub owner (android_device_samsung_<코드네임>)"
+        required: true
+        default: "richtermalibudev888"
+      device_tree_branch:
+        description: "디바이스 트리 브랜치"
+        required: true
+        default: "android-12.1"
+      fox_branch:
+        description: "OrangeFox 소스 브랜치 (sync 스크립트 --branch 값)"
+        required: true
+        default: "12.1"
+      fox_variant:
+        description: "FOX_VARIANT (빌드 이름에 붙음)"
+        required: false
+        default: ""
+      release:
+        description: "GitHub Release로도 올리기"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - id: set
+        run: |
+          echo "matrix=$(echo '${{ inputs.devices }}' | tr -d ' ' | jq -Rc 'split(",") | map(select(length>0))')" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        device: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      DEVICE: ${{ matrix.device }}
+      SRC: ${{ github.workspace }}/fox
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            git-core gnupg flex bison build-essential zip unzip curl zlib1g-dev \
+            libc6-dev-i386 x11proto-core-dev libx11-dev lib32z1-dev libgl1-mesa-dev \
+            libxml2-utils xsltproc fontconfig python3 python-is-python3 \
+            rsync bc ccache lz4 cpio libssl-dev libncurses-dev repo
+          for l in libncurses libtinfo; do
+            [ -e /usr/lib/x86_64-linux-gnu/$l.so.5 ] || \
+              sudo ln -sf /usr/lib/x86_64-linux-gnu/$l.so.6 /usr/lib/x86_64-linux-gnu/$l.so.5
+          done
+          git config --global user.name "ssch71"
+          git config --global user.email "ssch71@users.noreply.github.com"
+          git config --global color.ui false
+
+      - name: Sync OrangeFox source
+        run: |
+          git clone --depth=1 https://gitlab.com/OrangeFox/sync.git "$GITHUB_WORKSPACE/fox-sync"
+          cd "$GITHUB_WORKSPACE/fox-sync"
+          ./orangefox_sync.sh --branch ${{ inputs.fox_branch }} --path "$SRC"
+
+      - name: Checkout sm8550-common (this repo)
+        uses: actions/checkout@v4
+        with:
+          path: fox/device/samsung/sm8550-common
+
+      - name: Clone device tree & deps
+        run: |
+          cd "$SRC"
+          git clone --depth=1 -b ${{ inputs.device_tree_branch }} \
+            https://github.com/${{ inputs.device_tree_owner }}/android_device_samsung_${DEVICE} \
+            device/samsung/${DEVICE}
+          # twrp.dependencies가 없는 TeamWin 리모트를 가리켜서 roomservice 대신 직접 배치
+          rm -f device/samsung/${DEVICE}/twrp.dependencies device/samsung/sm8550-common/twrp.dependencies
+          [ -d device/qcom/twrp-common ] || git clone --depth=1 -b android-12.1 \
+            https://github.com/TeamWin/android_device_qcom_twrp-common device/qcom/twrp-common
+
+      - name: Build OrangeFox
+        run: |
+          cd "$SRC"
+          set +e
+          source build/envsetup.sh
+          set -e
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export LC_ALL=C
+          export FOX_BUILD_TYPE=Unofficial
+          export OF_MAINTAINER=ssch71
+          export FOX_VARIANT="${{ inputs.fox_variant }}"
+          lunch twrp_${DEVICE}-eng
+          mka -j$(nproc --all) adbd recoveryimage
+
+      - name: Package (img + zip + Odin tar)
+        id: pkg
+        run: |
+          OUT="$SRC/out/target/product/${DEVICE}"
+          TAG="$(date -u +%Y%m%d-%H%M)"
+          NAME="OrangeFox-${DEVICE}-${TAG}"
+          mkdir -p "$GITHUB_WORKSPACE/dist" && cd "$GITHUB_WORKSPACE/dist"
+          ls -la "$OUT"
+          # OrangeFox 후처리 산출물이 있으면 그걸, 없으면 bootimg.mk가 만든 recovery.img
+          FOXIMG=$(ls -t "$OUT"/OrangeFox*.img 2>/dev/null | head -1 || true)
+          cp "${FOXIMG:-$OUT/recovery.img}" recovery.img
+          cp "$OUT"/OrangeFox*.zip . 2>/dev/null || true
+          tar -H ustar -cf "${NAME}.tar" recovery.img
+          md5sum -t "${NAME}.tar" >> "${NAME}.tar"
+          mv "${NAME}.tar" "${NAME}.tar.md5"
+          mv recovery.img "${NAME}.img"
+          sha256sum * > SHA256SUMS
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: dist/*
+
+      - name: Release
+        if: ${{ inputs.release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: fox-${{ env.DEVICE }}-${{ steps.pkg.outputs.tag }}
+          name: OrangeFox ${{ env.DEVICE }} ${{ steps.pkg.outputs.tag }}
+          files: dist/*
